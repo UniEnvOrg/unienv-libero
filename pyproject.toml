@@ -1,0 +1,15 @@
+[project]
+name = "unienv_libero"
+version = "0.0.1a1"
+requires-python = ">= 3.10"
+dependencies = [
+    "unienv",
+    "h5py",
+]
+
+[project.optional-dependencies]
+
+
+[tool.setuptools.packages.find]
+include = ["*"]
+exclude = ["training*", "tests*", "examples*"]
