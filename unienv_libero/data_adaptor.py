@@ -6,14 +6,121 @@ from functools import cached_property
 from unienv_interface.backends.numpy import NumpyComputeBackend, NumpyArrayType, NumpyDeviceType, NumpyDtypeType, NumpyRNGType
 from unienv_interface.space import Space, BoxSpace, DictSpace
 from unienv_interface.space.space_utils import batch_utils as sbu
+from unienv_interface.space.space_utils.metadata_utils import (
+    action_metadata,
+    annotate,
+    depth_metadata,
+    image_metadata,
+    metadata,
+    proprio_metadata,
+)
 from unienv_data.base import BatchBase, IndexableType
 from unienv_data.storages.hdf5 import HDF5Storage
 from unienv_data.batches.combined_batch import convert_single_index_to_batch, convert_index_to_batch
 import h5py
 
 __all__ = [
-    'LiberoHDF5Data'
+    'LiberoHDF5Data',
+    'libero_space_metadata',
 ]
+
+# Cameras of the LIBERO datasets: observation key -> robosuite camera name.
+_LIBERO_CAMERAS = {
+    "agentview": "agentview",
+    "eye_in_hand": "robot0_eye_in_hand",
+}
+# robosuite OSC_POSE (LIBERO's controller) maps the normalized [-1, 1] action
+# to +-0.05 m position and +-0.5 rad axis-angle deltas; the gripper command is
+# -1 (open) .. 1 (close).
+_OSC_POSE_ACTION_RANGE = [
+    [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5, -1.0],
+    [0.05, 0.05, 0.05, 0.5, 0.5, 0.5, 1.0],
+]
+
+
+def _last_dim(space: Space) -> Optional[int]:
+    shape = getattr(space, "shape", None)
+    return shape[-1] if shape else None
+
+
+def libero_space_metadata(
+    space: DictSpace,
+    image_convention: Optional[str] = "opengl",
+) -> Dict[str, Dict[str, Any]]:
+    """``annotate`` mapping for the space of one LIBERO demo group (``data/demo_<i>``).
+
+    Keyed on the layout written by LIBERO's ``scripts/create_dataset.py``;
+    only paths present in ``space`` are returned. ``image_convention`` is the
+    file's ``data.attrs["macros_image_convention"]`` (robosuite's
+    ``IMAGE_CONVENTION``): with ``"opengl"`` the images are stored upside down
+    (``flipped="vertical"``).
+
+    - ``obs/{agentview,eye_in_hand}_rgb``: uint8 (H, W, 3) RGB renders
+    - ``obs/{agentview,eye_in_hand}_depth`` (``--use-depth``): robosuite's raw
+      depth buffer, normalized and non-linear, not meters, so no ``units``
+    - ``obs/ee_pos`` (m), ``obs/ee_ori`` (axis-angle, rad), ``obs/ee_states``
+      (both): ``robot0_eef_pos`` / ``robot0_eef_quat`` in the world frame
+    - ``obs/joint_states``: arm joint positions (rad); ``obs/gripper_states``:
+      gripper finger joint positions (m)
+    - ``robot_states``: gripper qpos (2) + eef pos (3) + eef quat (4, xyzw)
+    - ``actions``: OSC_POSE delta, normalized to [-1, 1]
+    - ``states``: the flattened MuJoCo state (privileged); ``rewards`` / ``dones``
+    """
+    flip = {"flipped": "vertical"} if image_convention == "opengl" else {}
+    convention = {"image_convention": image_convention} if image_convention is not None else {}
+    obs_space = space.spaces.get("obs")
+    obs_keys = obs_space.spaces if isinstance(obs_space, DictSpace) else {}
+    table: Dict[str, Dict[str, Any]] = {}
+
+    for key, camera in _LIBERO_CAMERAS.items():
+        if f"{key}_rgb" in obs_keys:
+            table[f"obs/{key}_rgb"] = image_metadata(source=camera, **convention, **flip)
+        if f"{key}_depth" in obs_keys:
+            depth_space = obs_keys[f"{key}_depth"]
+            table[f"obs/{key}_depth"] = depth_metadata(
+                units=None, layout="HWC" if len(depth_space.shape) == 3 else "HW",
+                source=camera, **convention, **flip,
+                label="raw robosuite depth buffer (normalized, non-linear; not meters)",
+            )
+
+    proprio = {
+        "ee_pos": proprio_metadata(units="m", frame="world", names=["x", "y", "z"]),
+        "ee_ori": proprio_metadata(units="rad", frame="world", rotation="axis_angle", names=["ax", "ay", "az"]),
+        "ee_states": proprio_metadata(
+            units=["m", "m", "m", "rad", "rad", "rad"], frame="world", rotation="axis_angle",
+            names=["x", "y", "z", "ax", "ay", "az"],
+        ),
+        "joint_states": proprio_metadata(units="rad"),
+        "gripper_states": proprio_metadata(units="m", label="gripper finger joint positions"),
+    }
+    for key, md in proprio.items():
+        if key in obs_keys:
+            table[f"obs/{key}"] = md
+
+    if "actions" in space.spaces:
+        if _last_dim(space["actions"]) == 7:
+            table["actions"] = action_metadata(
+                control="eef_pose", mode="delta", normalized=True, range=_OSC_POSE_ACTION_RANGE,
+                frame="world", rotation="axis_angle",
+                names=["x", "y", "z", "ax", "ay", "az", "gripper"],
+                units=["m", "m", "m", "rad", "rad", "rad", "normalized"],
+                controller="OSC_POSE", label="OSC_POSE delta; gripper -1 open, 1 close",
+            )
+        else:
+            table["actions"] = action_metadata()
+    if "robot_states" in space.spaces and _last_dim(space["robot_states"]) == 9:
+        table["robot_states"] = proprio_metadata(
+            frame="world", rotation="quat_xyzw",
+            names=["gripper_q0", "gripper_q1", "x", "y", "z", "qx", "qy", "qz", "qw"],
+            units=["m", "m", "m", "m", "m", "normalized", "normalized", "normalized", "normalized"],
+        )
+    if "states" in space.spaces:
+        table["states"] = metadata("privileged", label="flattened MuJoCo simulator state")
+    if "rewards" in space.spaces:
+        table["rewards"] = metadata(None, label="reward (1 on task success)")
+    if "dones" in space.spaces:
+        table["dones"] = metadata(None, label="episode done flag")
+    return table
 
 class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, NumpyDtypeType, NumpyRNGType]):
     """Adaptor to convert Libero HDF5 data to UniEnvPy format."""
@@ -29,6 +136,13 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
         # Build space
         first_episode = self.episode_root[next(iter(self.episode_root.keys()))]
         _, _, first_space = HDF5Storage.build_space_from_hdf5_file(first_episode)
+        image_convention = self.episode_root.attrs.get("macros_image_convention", "opengl")
+        if isinstance(image_convention, bytes):
+            image_convention = image_convention.decode()
+        first_space = annotate(
+            first_space,
+            libero_space_metadata(first_space, image_convention=str(image_convention)),
+        )
         self.episode_names = list(self.episode_root.keys())
         self.episode_lengths = np.array([self.episode_root[ep_name]['actions'].shape[0] for ep_name in self.episode_names], dtype=np.int64)
         episode_ends = np.cumsum(self.episode_lengths)
@@ -46,6 +160,7 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
                         high=np.inf,
                         dtype=np.int64,
                         shape=(),
+                        metadata=metadata(None, label="step index within the episode"),
                     ),
                     "episode_id": BoxSpace(
                         NumpyComputeBackend,
@@ -53,6 +168,7 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
                         high=np.inf,
                         dtype=np.int64,
                         shape=(),
+                        metadata=metadata(None, label="episode index within the file"),
                     ),
                 }
             )
