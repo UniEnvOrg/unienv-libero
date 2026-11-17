@@ -266,6 +266,13 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
 
     def get_at(self, idx):
         return self.get_at_with_metadata(idx)[0]
+
+    def close(self):
+        hdf5_file = getattr(self, "hdf5_file", None)  # absent if __init__ failed to open it
+        if hdf5_file is not None:
+            hdf5_file.close()
+            self.hdf5_file = None
+            self.episode_root = None
     
     @cached_property
     def language_instruction(self) -> str:

@@ -96,3 +96,13 @@ def test_libero_opencv_convention_is_not_flipped(tmp_path):
         assert "flipped" not in md and md["image_convention"] == "opencv"
     finally:
         data.hdf5_file.close()
+
+
+def test_close_closes_the_hdf5_file(libero_file):
+    path, _ = libero_file
+    data = LiberoHDF5Data(path)
+    hdf5_file = data.hdf5_file
+    assert len(data) > 0 and hdf5_file.id.valid
+    data.close()
+    assert not hdf5_file.id.valid
+    data.close()  # closing twice (and again from __del__) is fine
