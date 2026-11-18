@@ -1,16 +1,35 @@
 [project]
 name = "unienv_libero"
 version = "0.0.1a1"
+description = "LIBERO for UniEnv: the demonstration datasets and the simulated tasks in one observation layout"
+readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">= 3.10"
 dependencies = [
     "unienv>=0.0.1b16",
+    "numpy",
     "h5py",
 ]
 
 [project.optional-dependencies]
+# LIBERO (MIT; Hugging Face's packaging, as used by LeRobot) pins robosuite 1.4.0,
+# which breaks with MuJoCo >= 3.10.
+env = [
+    "libero>=0.1.1",
+    "mujoco>=3.0,<3.10",
+]
+test = ["pytest"]
 
+[project.urls]
+Homepage = "https://github.com/UniEnvOrg/unienv-libero"
+Documentation = "https://github.com/UniEnvOrg/unienv-libero"
+Repository = "https://github.com/UniEnvOrg/unienv-libero"
+Issues = "https://github.com/UniEnvOrg/unienv-libero/issues"
+Changelog = "https://github.com/UniEnvOrg/unienv-libero/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["*"]
 exclude = ["training*", "tests*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
