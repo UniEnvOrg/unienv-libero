@@ -56,12 +56,23 @@ Installing LIBERO builds `egl_probe`, which needs CMake; with CMake 4 set
 ## Datasets
 
 ```python
-from unienv_libero import LiberoHDF5Data
+from unienv_libero import LiberoHDF5Data, LiberoSuiteData
 
-data = LiberoHDF5Data("libero_spatial/pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5")
-batch, metadata = data.get_at_with_metadata([0, 1, 2])   # metadata: episode_id, step_i
-data.language_instruction
+task = LiberoHDF5Data("libero_spatial/pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5")
+suite = LiberoSuiteData("libero_spatial/")                    # every task file of a directory (or a list of files)
+batch, metadata = suite.get_at_with_metadata([5, 4021, 77])
+metadata["language_instruction"], metadata["episode_id"], metadata["batch_index"]
 ```
+
+- `LiberoHDF5Data` reads one demonstration file (one task); demonstrations are in numeric order
+  (`episode_id` *i* is `demo_<i>`). `LiberoSuiteData` combines files, one after the other.
+- Every sample's metadata holds its `step_i`, `episode_id` (unique across the files of a `LiberoSuiteData`;
+  `episode_offsets` gives each file's first id), its task's `language_instruction` and, for a suite, the
+  `batch_index` of its file (see `files` / `language_instructions`).
+- `exclude_keys=["states", "obs/eye_in_hand_rgb"]` leaves keys out of the space; they are not read. The files
+  of a suite must share their space: the flattened simulator `states` has scene-dependent sizes across suites
+  and within `libero_90`, so exclude it there (the error names the keys that differ).
+- Any index array works (unsorted, repeated, negative).
 
 The space is inferred from the file and annotated with UniEnv space metadata (`libero_space_metadata`),
 following LIBERO's `scripts/create_dataset.py` layout: cameras, end-effector / joint / gripper states and

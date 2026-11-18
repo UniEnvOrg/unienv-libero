@@ -1,10 +1,12 @@
-from typing import Dict, Any, Optional, Union, Tuple
+from typing import Dict, Any, Optional, Union, Tuple, Sequence, List
+import glob
 import os
+import re
 import numpy as np
 from functools import cached_property
 
 from unienv_interface.backends.numpy import NumpyComputeBackend, NumpyArrayType, NumpyDeviceType, NumpyDtypeType, NumpyRNGType
-from unienv_interface.space import Space, BoxSpace, DictSpace
+from unienv_interface.space import Space, BoxSpace, DictSpace, TextSpace
 from unienv_interface.space.space_utils import batch_utils as sbu
 from unienv_interface.space.space_utils.metadata_utils import (
     action_metadata,
@@ -16,11 +18,12 @@ from unienv_interface.space.space_utils.metadata_utils import (
 )
 from unienv_data.base import BatchBase, IndexableType
 from unienv_data.storages.hdf5 import HDF5Storage
-from unienv_data.batches.combined_batch import convert_single_index_to_batch, convert_index_to_batch
+from unienv_data.batches.combined_batch import CombinedBatch, convert_single_index_to_batch, convert_index_to_batch
 import h5py
 
 __all__ = [
     'LiberoHDF5Data',
+    'LiberoSuiteData',
     'libero_space_metadata',
 ]
 
@@ -122,20 +125,78 @@ def libero_space_metadata(
         table["dones"] = metadata(None, label="episode done flag")
     return table
 
+#: Room for the language instruction in the batch metadata (the LIBERO ones are < 150 characters)
+_INSTRUCTION_MAX_LENGTH = 512
+
+
+def _demo_sort_key(name: str):
+    """``demo_<n>`` in numeric order (h5py lists ``demo_10`` before ``demo_2``)."""
+    match = re.fullmatch(r"demo_(\d+)", name)
+    return (0, int(match.group(1)), name) if match else (1, 0, name)
+
+
+def _drop_paths(space: DictSpace, paths: Sequence[str]) -> DictSpace:
+    """``space`` without the (``/``-separated, possibly nested) keys in ``paths``."""
+    spaces = dict(space.spaces)
+    nested: Dict[str, List[str]] = {}
+    for path in paths:
+        head, _, rest = str(path).strip("/").partition("/")
+        if head not in spaces:
+            raise KeyError(f"cannot exclude {path!r}: no key {head!r} (keys: {sorted(spaces)})")
+        if rest:
+            nested.setdefault(head, []).append(rest)
+        else:
+            spaces.pop(head)
+    for head, rests in nested.items():
+        if head in spaces:
+            if not isinstance(spaces[head], DictSpace):
+                raise KeyError(f"cannot exclude {head}/{rests[0]}: {head!r} is not a group")
+            spaces[head] = _drop_paths(spaces[head], rests)
+    return DictSpace(space.backend, spaces, device=space.device, metadata=space.metadata)
+
+
+def _take(tree: Any, index: np.ndarray) -> Any:
+    """``leaf[index]`` for every array of a nested dict."""
+    if isinstance(tree, dict):
+        return {key: _take(value, index) for key, value in tree.items()}
+    return np.asarray(tree)[index]
+
+
 class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, NumpyDtypeType, NumpyRNGType]):
-    """Adaptor to convert Libero HDF5 data to UniEnvPy format."""
+    """A LIBERO demonstration HDF5 file (one task) as a UniEnv batch.
+
+    Samples are the steps of the file's demonstrations (``data/demo_<i>``, in
+    numeric order), with the space inferred from the file and annotated with
+    :func:`libero_space_metadata`. Every sample's metadata holds its ``step_i``,
+    ``episode_id`` (``episode_id_offset`` + the demonstration's index) and the
+    task's ``language_instruction``.
+
+    Args:
+        hdf5_path: The demonstration file.
+        exclude_keys: Keys left out of the space (and not read), ``/``-separated
+            for nested ones, e.g. ``["states", "obs/eye_in_hand_rgb"]``.
+        episode_id_offset: Added to the episode ids (to keep them unique across
+            files, as :class:`LiberoSuiteData` does).
+    """
 
     def __init__(
         self,
         hdf5_path: Union[str, os.PathLike],
+        *,
+        exclude_keys: Optional[Sequence[str]] = None,
+        episode_id_offset: int = 0,
     ):
         self.hdf5_path = hdf5_path
         self.hdf5_file = h5py.File(hdf5_path, "r")
         self.episode_root = self.hdf5_file['data']
-        self.n_episodes = len(self.episode_root)
+        self.episode_names = sorted(self.episode_root.keys(), key=_demo_sort_key)
+        self.n_episodes = len(self.episode_names)
+        self.episode_id_offset = int(episode_id_offset)
         # Build space
-        first_episode = self.episode_root[next(iter(self.episode_root.keys()))]
+        first_episode = self.episode_root[self.episode_names[0]]
         _, _, first_space = HDF5Storage.build_space_from_hdf5_file(first_episode)
+        if exclude_keys:
+            first_space = _drop_paths(first_space, exclude_keys)
         image_convention = self.episode_root.attrs.get("macros_image_convention", "opengl")
         if isinstance(image_convention, bytes):
             image_convention = image_convention.decode()
@@ -143,7 +204,6 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
             first_space,
             libero_space_metadata(first_space, image_convention=str(image_convention)),
         )
-        self.episode_names = list(self.episode_root.keys())
         self.episode_lengths = np.array([self.episode_root[ep_name]['actions'].shape[0] for ep_name in self.episode_names], dtype=np.int64)
         episode_ends = np.cumsum(self.episode_lengths)
         self.episode_starts = np.concatenate(([0], episode_ends[:-1]))
@@ -168,7 +228,12 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
                         high=np.inf,
                         dtype=np.int64,
                         shape=(),
-                        metadata=metadata(None, label="episode index within the file"),
+                        metadata=metadata(None, label="episode index (within the file, plus episode_id_offset)"),
+                    ),
+                    "language_instruction": TextSpace(
+                        NumpyComputeBackend,
+                        max_length=_INSTRUCTION_MAX_LENGTH,
+                        metadata=metadata("task", label="language instruction of the task"),
                     ),
                 }
             )
@@ -189,9 +254,11 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
             slice(None),
             reduce_io=False
         )
+        length = int(self.episode_lengths[episode_idx])
         metadata = {
-            "step_i": np.arange(self.episode_lengths[episode_idx], dtype=np.int64),
-            "episode_id": episode_idx,
+            "step_i": np.arange(length, dtype=np.int64),
+            "episode_id": np.full((length,), self.episode_id_offset + episode_idx, dtype=np.int64),
+            "language_instruction": np.full((length,), self.language_instruction, dtype=object),
         }
         return read_data, metadata
 
@@ -202,18 +269,36 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         episode_name = self.episode_names[episode_idx]
         episode_data = self.episode_root[episode_name]
-        read_data = HDF5Storage.get_from(
-            episode_data,
-            self.single_space,
-            step_idx,
-            reduce_io=False
-        )
+        if isinstance(step_idx, (int, np.integer, slice)):
+            step_idx = int(step_idx) if isinstance(step_idx, np.integer) else step_idx
+            read_data = HDF5Storage.get_from(episode_data, self.single_space, step_idx, reduce_io=False)
+        else:
+            step_idx = np.asarray(step_idx)
+            if step_idx.dtype == np.bool_:
+                step_idx = np.flatnonzero(step_idx)
+            step_idx = np.where(step_idx < 0, step_idx + int(self.episode_lengths[episode_idx]), step_idx)
+            # h5py only reads strictly increasing indices: read each step once, in order
+            # (consecutive runs as slices), then put the rows back in the requested order
+            unique, inverse = np.unique(step_idx, return_inverse=True)
+            read_data = _take(
+                HDF5Storage.get_from(episode_data, self.single_space, unique, reduce_io=True),
+                inverse.reshape(step_idx.shape),
+            )
 
-        B = read_data['actions'].shape[0] if not isinstance(step_idx, int) else 1
-        metadata = {
-            "step_i": np.arange(int(self.episode_lengths[episode_idx]), dtype=np.int64)[step_idx] if not isinstance(step_idx, int) else np.array(step_idx, dtype=np.int64),
-            "episode_id": np.full((B,), episode_idx, dtype=np.int64) if not isinstance(step_idx, int) else np.array(episode_idx, dtype=np.int64),
-        }
+        episode_id = self.episode_id_offset + episode_idx
+        if isinstance(step_idx, int):
+            metadata = {
+                "step_i": np.array(step_idx, dtype=np.int64),
+                "episode_id": np.array(episode_id, dtype=np.int64),
+                "language_instruction": self.language_instruction,
+            }
+        else:
+            steps = np.arange(int(self.episode_lengths[episode_idx]), dtype=np.int64)[step_idx]
+            metadata = {
+                "step_i": steps,
+                "episode_id": np.full(steps.shape, episode_id, dtype=np.int64),
+                "language_instruction": np.full(steps.shape, self.language_instruction, dtype=object),
+            }
         return read_data, metadata
 
     def get_at_with_metadata(self, idx):
@@ -291,3 +376,96 @@ class LiberoHDF5Data(BatchBase[Dict[str, Any], NumpyArrayType, NumpyDeviceType, 
             instruction_end = name_base.rfind(".hdf5")
         instruction = name_base[:instruction_end].replace("_", " ")
         return instruction
+
+
+class LiberoSuiteData(CombinedBatch[Dict[str, Any], NumpyArrayType, NumpyDeviceType, NumpyDtypeType, NumpyRNGType]):
+    """Several LIBERO demonstration files (e.g. a suite's directory) as one batch.
+
+    Each file is a :class:`LiberoHDF5Data`; samples are their steps, file after
+    file. The metadata of every sample adds ``batch_index`` (the file, see
+    :attr:`files` / :attr:`language_instructions`) to the file's ``step_i``,
+    ``language_instruction`` and ``episode_id``, which is unique across the files
+    (:attr:`episode_offsets`).
+
+    The files must share their space. Within a suite they do; across suites (or
+    within ``libero_90``) the flattened simulator ``states`` has scene-dependent
+    sizes: leave it out with ``exclude_keys=["states"]`` (the error names the
+    keys that differ).
+
+    Args:
+        files: A directory (its ``*.hdf5`` files, sorted by name) or paths.
+        exclude_keys: Passed to every :class:`LiberoHDF5Data`.
+        use_thread_pool: Read the files of a batch in parallel threads.
+    """
+
+    def __init__(
+        self,
+        files: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
+        *,
+        exclude_keys: Optional[Sequence[str]] = None,
+        use_thread_pool: bool = False,
+    ):
+        if isinstance(files, (str, os.PathLike)):
+            if not os.path.isdir(files):
+                raise ValueError(f"{files!r} is not a directory; pass a directory or a list of files")
+            paths = sorted(glob.glob(os.path.join(os.fspath(files), "*.hdf5")))
+        else:
+            paths = [os.fspath(path) for path in files]
+        if len(paths) < 2:
+            raise ValueError(
+                f"LiberoSuiteData combines several files, got {len(paths)}; use LiberoHDF5Data for one file"
+            )
+        datasets: List[LiberoHDF5Data] = []
+        try:
+            offset = 0
+            for path in paths:
+                dataset = LiberoHDF5Data(path, exclude_keys=exclude_keys, episode_id_offset=offset)
+                datasets.append(dataset)
+                offset += dataset.num_trajectories()
+            mismatched = self._mismatched_keys(datasets)
+            if mismatched:
+                raise ValueError(
+                    "the files do not share their space; keys that differ: "
+                    + ", ".join(mismatched)
+                    + " (leave them out with exclude_keys=[...])"
+                )
+        except BaseException:
+            for dataset in datasets:
+                dataset.close()
+            raise
+        self.files: List[str] = paths
+        self.episode_offsets = np.array([d.episode_id_offset for d in datasets], dtype=np.int64)
+        super().__init__(datasets, use_thread_pool=use_thread_pool)
+
+    @staticmethod
+    def _mismatched_keys(datasets: Sequence[LiberoHDF5Data]) -> List[str]:
+        def leaves(space: Space, prefix: str = "") -> Dict[str, Space]:
+            if isinstance(space, DictSpace):
+                out: Dict[str, Space] = {}
+                for key, sub in space.spaces.items():
+                    out.update(leaves(sub, f"{prefix}{key}/"))
+                return out
+            return {prefix.rstrip("/"): space}
+
+        reference = leaves(datasets[0].single_space)
+        mismatched = set()
+        for dataset in datasets[1:]:
+            other = leaves(dataset.single_space)
+            for key in set(reference) | set(other):
+                if key not in reference or key not in other or reference[key] != other[key]:
+                    mismatched.add(key)
+        return sorted(mismatched)
+
+    @property
+    def language_instructions(self) -> List[str]:
+        """The instruction of every file, indexed by ``batch_index``."""
+        return [dataset.language_instruction for dataset in self.batches]
+
+    def num_trajectories(self) -> int:
+        return int(sum(dataset.num_trajectories() for dataset in self.batches))
+
+    def close(self) -> None:
+        # Unlike a plain CombinedBatch view, the suite opened its files and owns them
+        super().close()
+        for dataset in getattr(self, "batches", []):
+            dataset.close()
