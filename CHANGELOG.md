@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.1a2 (unreleased)
+## 0.0.1a2 (2026-11-18)
 
 - `LiberoSuiteData`: several demonstration files (e.g. a suite's directory) as one batch, with episode ids
   unique across the files and the file's `batch_index`; files with differing spaces raise an error naming the
@@ -12,7 +12,7 @@
 - Fixed: reading with an unsorted or repeated index array (e.g. random sampling) failed in h5py ("Indexing
   elements must be in increasing order").
 
-## 0.0.1a1 (unreleased)
+## 0.0.1a1 (2026-11-18)
 
 - `FromLiberoEnv`: LIBERO tasks as a UniEnv environment with the observation layout, dtypes, image
   convention and space metadata of the demonstration datasets (`libero_env_spaces`, `libero_observation`);

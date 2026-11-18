@@ -1,6 +1,6 @@
 [project]
 name = "unienv_libero"
-version = "0.0.1a1"
+version = "0.0.1a2"
 description = "LIBERO for UniEnv: the demonstration datasets and the simulated tasks in one observation layout"
 readme = "README.md"
 license = "Apache-2.0"
